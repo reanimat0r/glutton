@@ -1,17 +1,31 @@
-FROM golang:1.11-alpine
+FROM golang:1.13-alpine AS build-env
 RUN apk update
 RUN apk add libnetfilter_queue-dev iptables-dev libpcap-dev
 
-RUN mkdir -p $GOPATH/src/github.com/mushorg/glutton
-WORKDIR $GOPATH/src/github.com/mushorg/glutton
+RUN mkdir -p /opt/glutton
+WORKDIR /opt/glutton
 
-RUN apk add g++ git
+RUN apk add g++ git make
 
 RUN cd $WORKDIR
+ENV GO111MODULE=on
+
+# Fetch dependencies
+COPY go.mod ./
+RUN go mod download
+
 ADD . .
 
-RUN go build -o server app/server.go && \
-    apk del g++ git && \
-    rm -rf /var/cache/apk/*
+RUN make build
 
-CMD ["./server", "-i", "eth0", "-l", "/var/log/glutton.log", "-d", "true"]
+# run container
+FROM alpine
+
+RUN apk add libnetfilter_queue-dev iptables-dev libpcap-dev
+WORKDIR /opt/glutton
+
+COPY --from=build-env /opt/glutton/bin/server /opt/glutton/bin/server
+COPY --from=build-env /opt/glutton/config /opt/glutton/config
+COPY --from=build-env /opt/glutton/rules /opt/glutton/rules
+
+CMD ["./bin/server", "-i", "eth0", "-l", "/var/log/glutton.log", "-d", "true"]

@@ -1,4 +1,4 @@
-package main // import "github.com/mushorg/glutton"
+package main // import "github.com/mushorg/glutton/app"
 
 import (
 	"fmt"
@@ -10,6 +10,13 @@ import (
 	"github.com/mushorg/glutton"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+)
+
+var (
+	// VERSION is set by the makefile
+	VERSION = "v0.0.0"
+	// BUILDDATE is set by the makefile
+	BUILDDATE = ""
 )
 
 func onErrorExit(err error) {
@@ -39,14 +46,21 @@ func main() {
  \_____|_|\__,_|\__|\__\___/|_| |_|
 
 	`)
+	fmt.Printf("%s %s\n", VERSION, BUILDDATE)
 
 	pflag.StringP("interface", "i", "eth0", "Bind to this interface")
 	pflag.StringP("logpath", "l", "/dev/null", "Log file path")
 	pflag.StringP("confpath", "c", "config/", "Configuration file path")
 	pflag.BoolP("debug", "d", false, "Enable debug mode")
+	pflag.Bool("version", false, "Print version")
+	pflag.String("var-dir", "/var/lib/glutton", "Set var-dir")
 
 	pflag.Parse()
 	viper.BindPFlags(pflag.CommandLine)
+
+	if viper.GetBool("version") {
+		return
+	}
 
 	gtn, err := glutton.New()
 	onErrorExit(err)

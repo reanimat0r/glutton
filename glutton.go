@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/kung-foo/freki"
-	"github.com/mushorg/glutton/config"
 	"github.com/mushorg/glutton/producer"
 	uuid "github.com/satori/go.uuid"
 	"github.com/spf13/viper"
@@ -21,11 +20,10 @@ import (
 // Glutton struct
 type Glutton struct {
 	id               uuid.UUID
-	conf             *viper.Viper
 	logger           *zap.Logger
 	processor        *freki.Processor
 	rules            []*freki.Rule
-	producer         *producer.Config
+	producer         *producer.Producer
 	protocolHandlers map[string]protocolHandlerFunc
 	telnetProxy      *telnetProxy
 	sshProxy         *sshProxy
@@ -35,24 +33,36 @@ type Glutton struct {
 
 type protocolHandlerFunc func(ctx context.Context, conn net.Conn) error
 
+func (g *Glutton) initConfig() error {
+	viper.SetConfigName("conf")
+	viper.AddConfigPath(viper.GetString("confpath"))
+	if err := viper.ReadInConfig(); err != nil {
+		return err
+	}
+	// If no config is found, use the defaults
+	viper.SetDefault("glutton_server", 5000)
+	viper.SetDefault("max_tcp_payload", 4096)
+	viper.SetDefault("rules_path", "rules/rules.yaml")
+	g.logger.Debug("configuration loaded successfully", zap.String("reporter", "glutton"))
+	return nil
+}
+
 // New creates a new Glutton instance
-func New() (g *Glutton, err error) {
-	g = &Glutton{}
+func New() (*Glutton, error) {
+	g := &Glutton{}
 	g.protocolHandlers = make(map[string]protocolHandlerFunc, 0)
-	viper.SetDefault("var-dir", "/var/lib/glutton")
-	if err = g.makeID(); err != nil {
+	if err := g.makeID(); err != nil {
 		return nil, err
 	}
 	g.logger = NewLogger(g.id.String())
 
-	// Loading the congiguration
+	// Loading the configuration
 	g.logger.Info("Loading configurations from: config/conf.yaml", zap.String("reporter", "glutton"))
-	g.conf, err = config.Init(g.logger)
-	if err != nil {
+	if err := g.initConfig(); err != nil {
 		return nil, err
 	}
 
-	rulesPath := g.conf.GetString("rules_path")
+	rulesPath := viper.GetString("rules_path")
 	rulesFile, err := os.Open(rulesPath)
 	defer rulesFile.Close()
 	if err != nil {
@@ -63,30 +73,31 @@ func New() (g *Glutton, err error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return g, nil
-
 }
 
 // Init initializes freki and handles
-func (g *Glutton) Init() (err error) {
-
+func (g *Glutton) Init() error {
 	ctx := context.Background()
 	g.ctx, g.cancel = context.WithCancel(ctx)
 
-	gluttonServerPort := uint(g.conf.GetInt("glutton_server"))
+	gluttonServerPort := uint(viper.GetInt("glutton_server"))
 
 	// Initiate the freki processor
+	var err error
 	g.processor, err = freki.New(viper.GetString("interface"), g.rules, nil)
 	if err != nil {
-		return
+		return err
 	}
 
 	// Initiating glutton server
 	g.processor.AddServer(freki.NewUserConnServer(gluttonServerPort))
-	// Initiating log producer
-	if g.conf.GetBool("enableGollum") {
-		g.producer = producer.Init(g.id.String(), g.conf.GetString("gollumAddress"))
+	// Initiating log producers
+	if viper.GetBool("producers.enabled") {
+		g.producer, err = producer.New(g.id.String())
+		if err != nil {
+			return err
+		}
 	}
 	// Initiating protocol handlers
 	g.mapProtocolHandlers()
@@ -94,15 +105,13 @@ func (g *Glutton) Init() (err error) {
 
 	err = g.processor.Init()
 	if err != nil {
-		return
+		return err
 	}
-
 	return nil
 }
 
 // Start the packet processor
-func (g *Glutton) Start() (err error) {
-
+func (g *Glutton) Start() error {
 	quit := make(chan struct{}) // stop monitor on shutdown
 	defer func() {
 		quit <- struct{}{}
@@ -110,24 +119,25 @@ func (g *Glutton) Start() (err error) {
 	}()
 
 	g.startMonitor(quit)
-	err = g.processor.Start()
-	return
+	return g.processor.Start()
 }
 
 func (g *Glutton) makeID() error {
 	fileName := "glutton.id"
 	filePath := filepath.Join(viper.GetString("var-dir"), fileName)
-	err := os.MkdirAll(viper.GetString("var-dir"), 0777)
-	if err != nil {
+	if err := os.MkdirAll(viper.GetString("var-dir"), 0744); err != nil {
 		return err
 	}
-	if f, err := os.OpenFile(filePath, os.O_RDWR, 0644); os.IsNotExist(err) {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		g.id = uuid.NewV4()
-		errWrite := ioutil.WriteFile(filePath, g.id.Bytes(), 0644)
-		if err != nil {
-			return errWrite
+		if err := ioutil.WriteFile(filePath, g.id.Bytes(), 0744); err != nil {
+			return err
 		}
 	} else {
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(filePath)
 		if err != nil {
 			return err
 		}
@@ -145,7 +155,6 @@ func (g *Glutton) makeID() error {
 
 // registerHandlers register protocol handlers to glutton_server
 func (g *Glutton) registerHandlers() {
-
 	for _, rule := range g.rules {
 
 		if rule.Type == "conn_handler" && rule.Target != "" {
@@ -153,14 +162,12 @@ func (g *Glutton) registerHandlers() {
 			var handler string
 
 			switch rule.Name {
-
 			case "proxy_tcp":
 				handler = rule.Name
 				g.protocolHandlers[rule.Target] = g.protocolHandlers[handler]
 				delete(g.protocolHandlers, handler)
 				handler = rule.Target
 				break
-
 			case "proxy_ssh":
 				handler = rule.Name
 				err := g.NewSSHProxy(rule.Target)
@@ -202,21 +209,23 @@ func (g *Glutton) registerHandlers() {
 				g.logger.Debug(
 					fmt.Sprintf("[glutton ] new connection: %s:%s -> %d", host, port, md.TargetPort),
 					zap.String("host", host),
-					zap.String("sport", port),
-					zap.String("dport", strconv.Itoa(int(md.TargetPort))),
+					zap.String("src_port", port),
+					zap.String("dest_port", strconv.Itoa(int(md.TargetPort))),
 					zap.String("handler", handler),
 				)
 
 				if g.producer != nil {
-					err = g.producer.LogHTTP(conn, md, nil, "")
-					if err != nil {
+					if err := g.producer.Log(conn, md, nil); err != nil {
 						g.logger.Error(fmt.Sprintf("[glutton ] error: %v", err))
+						return err
 					}
 				}
 
 				done := make(chan struct{})
 				go g.closeOnShutdown(conn, done)
-				conn.SetDeadline(time.Now().Add(45 * time.Second))
+				if err = conn.SetDeadline(time.Now().Add(time.Duration(viper.GetInt("conn_timeout")) * time.Second)); err != nil {
+					return err
+				}
 				ctx := g.contextWithTimeout(72)
 				err = g.protocolHandlers[handler](ctx, conn)
 				done <- struct{}{}
@@ -227,7 +236,7 @@ func (g *Glutton) registerHandlers() {
 }
 
 // Shutdown the packet processor
-func (g *Glutton) Shutdown() (err error) {
+func (g *Glutton) Shutdown() error {
 	defer g.logger.Sync()
 	g.cancel() // close all connection
 
